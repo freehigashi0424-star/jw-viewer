@@ -243,6 +243,7 @@ input[type=file] { display: none; }
     <div class="row">
       <button class="hbtn primary" id="bLocal">iPad / PC のファイル（.jww / .zip）</button>
       <button class="hbtn" id="bProj">プロジェクトのフォルダ</button>
+      <button class="hbtn" id="bOD">OneDrive</button>
     </div>
     <div class="crumbs" id="crumbs"></div>
     <div class="row"><input id="fsearch" type="search" placeholder="この下をファイル名で探す（例：平面）"></div>
@@ -1611,6 +1612,182 @@ function selAct(a) {
   setTool(a);
 }
 
+// ---------- OneDrive（ホーム画面アプリ版で、OneDrive の図面を直接開く・保存する） ----------
+// Microsoft のサインイン（認可コード + PKCE）を自前で行い、Microsoft Graph でフォルダをたどる
+const OD_BUILTIN_ID = '/*OD_CLIENT_ID*/';
+const OD_AUTH = 'https://login.microsoftonline.com/common/oauth2/v2.0/';
+const OD_SCOPE = 'Files.ReadWrite.All offline_access User.Read';
+const OD = { stack: null, items: null, deep: null };
+function odClientId() { let v = ''; try { v = localStorage.getItem('jwv.odClient') || ''; } catch (e) { /* なし */ } return v || (OD_BUILTIN_ID.startsWith('/*') ? '' : OD_BUILTIN_ID); }
+function odRedirect() { return location.origin + location.pathname; }
+function odAvailable() { return !(window.claude && window.claude.use) && location.protocol === 'https:'; }
+const lsGet = (k) => { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch (e) { return null; } };
+const lsSet = (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 覚えられなくても動く */ } };
+const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+async function odLogin() {
+  const id = odClientId();
+  if (!id) { odSetupNote(); return; }
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(48)));
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+  lsSet('jwv.odPkce', { verifier, state });
+  const q = new URLSearchParams({ client_id: id, response_type: 'code', redirect_uri: odRedirect(), scope: OD_SCOPE, code_challenge: challenge, code_challenge_method: 'S256', state, prompt: 'select_account' });
+  location.assign(OD_AUTH + 'authorize?' + q);
+}
+async function odTokenReq(params) {
+  const r = await fetch(OD_AUTH + 'token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: odClientId(), scope: OD_SCOPE, ...params }) });
+  const j = await r.json();
+  if (!r.ok) throw Object.assign(new Error(j.error_description || j.error || r.status), { code: j.error });
+  const tok = { access: j.access_token, refresh: j.refresh_token, exp: Date.now() + (j.expires_in - 120) * 1000 };
+  lsSet('jwv.odTok', tok); return tok;
+}
+// サインインから戻ってきたとき（URL に ?code= が付く）
+async function odHandleRedirect() {
+  const u = new URL(location.href), code = u.searchParams.get('code'), err = u.searchParams.get('error');
+  if (!code && !err) return false;
+  history.replaceState(null, '', odRedirect());
+  const pk = lsGet('jwv.odPkce'); lsSet('jwv.odPkce', null);
+  if (err) { toast('OneDrive にサインインできませんでした：' + (u.searchParams.get('error_description') || err), true); return true; }
+  if (!pk || pk.state !== u.searchParams.get('state')) { toast('サインインの確認に失敗しました。もう一度お試しください', true); return true; }
+  try { await odTokenReq({ grant_type: 'authorization_code', code, redirect_uri: odRedirect(), code_verifier: pk.verifier }); openDrawer('dFiles'); odBrowse(lsGet('jwv.odFolder') || null); }
+  catch (e) { toast('OneDrive にサインインできませんでした：' + e.message, true); }
+  return true;
+}
+async function odToken() {
+  let t = lsGet('jwv.odTok');
+  if (!t) return null;
+  if (Date.now() < t.exp) return t.access;
+  if (!t.refresh) return null;
+  try { t = await odTokenReq({ grant_type: 'refresh_token', refresh_token: t.refresh }); return t.access; } catch (e) { lsSet('jwv.odTok', null); return null; }
+}
+async function graph(path, opt) {
+  const tk = await odToken();
+  if (!tk) throw Object.assign(new Error('サインインが必要です'), { code: 'login' });
+  const r = await fetch(path.startsWith('https:') ? path : 'https://graph.microsoft.com/v1.0' + path, { ...(opt || {}), headers: { Authorization: 'Bearer ' + tk, ...((opt && opt.headers) || {}) } });
+  if (r.status === 401) { lsSet('jwv.odTok', null); throw Object.assign(new Error('サインインが切れました'), { code: 'login' }); }
+  if (!r.ok) { let m = r.status; try { const j = await r.json(); m = (j.error && j.error.message) || m; } catch (e) { /* なし */ } throw new Error(m); }
+  return r.status === 204 ? null : r.json();
+}
+async function graphAll(path) { let out = [], next = path; while (next) { const j = await graph(next); out = out.concat(j.value || []); next = j['@odata.nextLink']; if (out.length > 3000) break; } return out; }
+function odSetupNote() {
+  const box = $('#flist'); box.innerHTML = '';
+  const n = document.createElement('div'); n.className = 'note';
+  n.textContent = 'OneDrive につなぐ準備がまだです。Microsoft にこのアプリを登録して出てくる「アプリケーション (クライアント) ID」を、「設定」の「OneDrive の接続ID」に入れてください。';
+  box.append(n); $('#crumbs').innerHTML = '';
+}
+function odLoginNote(msg) {
+  const box = $('#flist'); box.innerHTML = ''; $('#crumbs').innerHTML = '';
+  const n = document.createElement('div'); n.className = 'note'; n.textContent = msg || 'OneDrive の図面を開くには、Microsoft アカウントでサインインします。';
+  const b = document.createElement('button'); b.className = 'hbtn primary'; b.textContent = 'Microsoft でサインイン'; b.style.margin = '10px 0'; b.onclick = odLogin;
+  box.append(n, b);
+}
+const odKids = (f) => (f.id === 'shared' ? '/me/drive/sharedWithMe' : f.driveId ? '/drives/' + f.driveId + '/items/' + f.id + '/children' : f.id ? '/me/drive/items/' + f.id + '/children' : '/me/drive/root/children');
+const isDrawing = (n) => /\.(jww|zip)$/i.test(n);
+async function odBrowse(stack) {
+  S.src = 'od';
+  if (!odClientId()) { odSetupNote(); return; }
+  if (!(await odToken())) { odLoginNote(); return; }
+  OD.stack = stack && stack.length ? stack : [{ name: 'OneDrive', id: null }];
+  OD.deep = null; $('#fsearch').value = '';
+  lsSet('jwv.odFolder', OD.stack);
+  odCrumbs(); fileNote('OneDrive のフォルダを読んでいます…');
+  try {
+    const cur = OD.stack[OD.stack.length - 1];
+    const list = await graphAll(odKids(cur) + (cur.id === 'shared' ? '' : '?$top=500&$select=id,name,size,folder,file,remoteItem,parentReference'));
+    OD.items = list.map((x) => {
+      const ri = x.remoteItem;
+      return { name: x.name, size: x.size || (ri && ri.size) || 0, isDir: !!(x.folder || (ri && ri.folder)), id: ri ? ri.id : x.id, driveId: ri ? ri.parentReference.driveId : cur.driveId || (x.parentReference && x.parentReference.driveId), parentId: ri ? ri.parentReference.id : x.parentReference && x.parentReference.id };
+    }).sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+    odRender();
+  } catch (e) { if (e.code === 'login') odLoginNote('サインインが切れました。もう一度サインインしてください。'); else fileNote('OneDrive を読めませんでした（' + e.message + '）'); }
+}
+function odCrumbs() {
+  const c = $('#crumbs'); c.innerHTML = '';
+  OD.stack.forEach((f, i) => {
+    if (i) { const sep = document.createElement('span'); sep.textContent = '›'; c.append(sep); }
+    const b = document.createElement('button'); b.className = 'crumb'; b.textContent = f.name; b.onclick = () => odBrowse(OD.stack.slice(0, i + 1)); c.append(b);
+  });
+  const out = document.createElement('button'); out.className = 'crumb'; out.textContent = '（サインアウト）'; out.style.marginLeft = 'auto';
+  out.onclick = () => { lsSet('jwv.odTok', null); lsSet('jwv.odFolder', null); odLoginNote('サインアウトしました。'); };
+  c.append(out);
+}
+function odFileBtn(it, dir) {
+  const b = document.createElement('button'); b.className = 'f' + (S.od && S.od.id === it.id ? ' cur' : '');
+  const sp = document.createElement('span'); sp.textContent = it.name.replace(/\.jww$/i, '');
+  const sm = document.createElement('small'); sm.textContent = Math.round(it.size / 1024).toLocaleString() + ' KB';
+  b.append(sp, sm);
+  if (dir) { const d = document.createElement('small'); d.className = 'dir'; d.textContent = dir; b.append(d); }
+  b.onclick = () => odOpen(it); return b;
+}
+function odRender() {
+  const box = $('#flist'); box.innerHTML = '';
+  const q = $('#fsearch').value.trim();
+  if (q) {
+    if (!OD.deep) return;
+    if (!OD.deep.length) { fileNote('「' + q + '」を含む図面は見つかりませんでした。'); return; }
+    for (const it of OD.deep) box.append(odFileBtn(it, it.dir)); return;
+  }
+  if (OD.stack.length > 1) {
+    const up = document.createElement('button'); up.className = 'f dirb'; const sp = document.createElement('span'); sp.textContent = '↑ 上のフォルダへ'; up.append(sp);
+    up.onclick = () => odBrowse(OD.stack.slice(0, -1)); box.append(up);
+  } else {
+    const sh = document.createElement('button'); sh.className = 'f dirb'; const sp = document.createElement('span'); sp.textContent = '▸ 自分と共有されたもの'; sh.append(sp);
+    sh.onclick = () => odBrowse([...OD.stack, { name: '共有', id: 'shared' }]); box.append(sh);
+  }
+  const dirs = OD.items.filter((x) => x.isDir), files = OD.items.filter((x) => !x.isDir && isDrawing(x.name));
+  for (const d of dirs) {
+    const b = document.createElement('button'); b.className = 'f dirb'; const sp = document.createElement('span'); sp.textContent = '▸ ' + d.name; b.append(sp);
+    b.onclick = () => odBrowse([...OD.stack, { name: d.name, id: d.id, driveId: d.driveId }]); box.append(b);
+  }
+  if (files.length) { const f = document.createElement('div'); f.className = 'folder'; f.textContent = 'このフォルダの図面'; box.append(f); }
+  for (const it of files) box.append(odFileBtn(it));
+  if (!files.length) { const n = document.createElement('div'); n.className = 'note'; n.textContent = dirs.length ? 'このフォルダに図面はありません。下のフォルダを開くか、上の欄に名前を入れて探してください。' : 'このフォルダに図面はありません。'; box.append(n); }
+}
+let odT = 0;
+function odSearch() {
+  clearTimeout(odT);
+  const q = $('#fsearch').value.trim();
+  if (!q) { OD.deep = null; odRender(); return; }
+  odT = setTimeout(async () => {
+    fileNote('OneDrive を探しています…');
+    try {
+      const cur = OD.stack[OD.stack.length - 1];
+      const base = cur.id && cur.id !== 'shared' ? (cur.driveId ? '/drives/' + cur.driveId + '/items/' + cur.id : '/me/drive/items/' + cur.id) : '/me/drive/root';
+      const list = await graphAll(base + "/search(q='" + encodeURIComponent(q.replace(/'/g, "''")) + "')?$top=200&$select=id,name,size,file,parentReference");
+      if ($('#fsearch').value.trim() !== q) return;
+      OD.deep = list.filter((x) => x.file && isDrawing(x.name)).map((x) => ({ name: x.name, size: x.size, id: x.id, driveId: x.parentReference && x.parentReference.driveId, parentId: x.parentReference && x.parentReference.id, dir: ((x.parentReference && x.parentReference.path) || '').replace(/^\/drive(s\/[^/]+)?\/root:?/, '') }));
+      odRender();
+    } catch (e) { fileNote('探せませんでした（' + e.message + '）'); }
+  }, 450);
+}
+async function odOpen(it) {
+  if (S.dirty && !(await confirmLose())) return;
+  $('#loading').style.display = 'flex';
+  try {
+    const p = it.driveId ? '/drives/' + it.driveId + '/items/' + it.id : '/me/drive/items/' + it.id;
+    const meta = await graph(p + '?$select=id,name,size,parentReference,@microsoft.graph.downloadUrl');
+    const url = meta['@microsoft.graph.downloadUrl'];
+    const r = await fetch(url); if (!r.ok) throw new Error(r.status);
+    const u8 = new Uint8Array(await r.arrayBuffer());
+    const od = { id: meta.id, name: meta.name, driveId: meta.parentReference.driveId, parentId: meta.parentReference.id };
+    if (u8[0] === 0x50 && u8[1] === 0x4b) { const z = await unzipJww(u8); await loadBytes(z.bytes, z.name, null); od.name = z.name; od.id = null; }
+    else await loadBytes(u8, meta.name, null);
+    S.od = od; closeDrawers();
+  } catch (e) { $('#loading').style.display = 'none'; toast('開けませんでした（' + e.message + '）', true); }
+}
+// OneDrive の同じフォルダに保存（4MB を超えるときは分けて送る）
+async function odSave(fname, data) {
+  const o = S.od, base = '/drives/' + o.driveId + '/items/' + o.parentId + ':/' + encodeURIComponent(fname) + ':';
+  if (data.length < 4e6) { await graph(base + '/content', { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: data }); return; }
+  const ses = await graph(base + '/createUploadSession', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ item: { '@microsoft.graph.conflictBehavior': 'replace' } }) });
+  const CH = 327680 * 16;
+  for (let off = 0; off < data.length; off += CH) {
+    const part = data.subarray(off, Math.min(data.length, off + CH));
+    const r = await fetch(ses.uploadUrl, { method: 'PUT', headers: { 'Content-Range': 'bytes ' + off + '-' + (off + part.length - 1) + '/' + data.length }, body: part });
+    if (!r.ok && r.status !== 202) throw new Error(r.status);
+  }
+}
+
 // ---------- 保存（.jww を zip に入れて渡す） ----------
 function crc32(u8) {
   let t = crc32.t;
@@ -1637,6 +1814,16 @@ async function save() {
   const fname = base + (S.dirty ? '_編集' : '') + '.jww';
   let data;
   try { data = JWW.serialize(S.doc); } catch (e) { toast('保存データを作れませんでした：' + e.message); return; }
+  if (S.od && odClientId()) {
+    const odName = base + '_編集.jww';
+    const go = await new Promise((res) => ask('OneDrive の元と同じフォルダに「' + odName + '」として保存しますか？（元の図面はそのまま残ります。同じ名前のファイルがあれば上書き。「やめる」なら iPad に保存）', null, (v) => res(v !== null), 'OneDrive に保存'));
+    if (go) {
+      $('#loading').style.display = 'flex';
+      try { await odSave(odName, data); toast('OneDrive に保存しました：' + odName); S.dirty = false; updTitle(); }
+      catch (e) { toast('OneDrive に保存できませんでした（' + e.message + '）', true); }
+      $('#loading').style.display = 'none'; return;
+    }
+  }
   const blob = zip(fname, data);
   if (!S.downloads) {
     // ホーム画面のアプリ版：.jww をそのまま渡す（iPad では「ファイル」に保存できる）
@@ -1662,7 +1849,7 @@ async function loadBytes(bytes, name, path) {
   try {
     const doc = JWW.parse(bytes);
     S.doc = doc; S.H = doc.header; S.name = name; S.path = path || null;
-    S.undo = []; S.redo = []; S.dirty = false; S.measures = []; S.cur = null; S.sel.clear(); S.cad = null;
+    S.undo = []; S.redo = []; S.dirty = false; S.measures = []; S.cur = null; S.sel.clear(); S.cad = null; S.od = null;
     $('#mCount').textContent = '0'; renderMeasList();
     S.vis = initialVis(); countLayers();
     S.wg = S.H.writeGLay & 15; S.wl = S.H.glay[S.wg].writeLay & 15;
@@ -2264,6 +2451,16 @@ function renderSettings() {
     sec.append(opts); box.append(sec);
   }
   const n = document.createElement('div'); n.className = 'note'; n.textContent = 'Apple Pencil の「握る（スクイーズ）」と「ダブルタップ」は、iPad がブラウザのページに伝えないため使えません。'; box.append(n);
+  if (odAvailable()) {
+    const sec = document.createElement('div'); sec.className = 'set';
+    const h = document.createElement('b'); h.textContent = 'OneDrive の接続ID'; sec.append(h);
+    const inp = document.createElement('input'); inp.type = 'text'; inp.placeholder = '例：xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'; inp.autocomplete = 'off'; inp.spellcheck = false;
+    inp.style.cssText = 'width:100%;height:40px;border-radius:8px;border:1px solid var(--line);background:var(--frame);color:var(--ink);padding:0 10px;font-size:14px;box-sizing:border-box';
+    try { inp.value = localStorage.getItem('jwv.odClient') || ''; } catch (e) { /* なし */ }
+    inp.onchange = () => { try { localStorage.setItem('jwv.odClient', inp.value.trim()); } catch (e) { /* なし */ } lsSet('jwv.odTok', null); toast(inp.value.trim() ? '接続IDを保存しました。「開く」→「OneDrive」からサインインしてください' : '接続IDを消しました'); };
+    const sm = document.createElement('div'); sm.className = 'note'; sm.textContent = OD_BUILTIN_ID.startsWith('/*') ? 'Microsoft に登録したアプリの「アプリケーション (クライアント) ID」を入れます。' : '空欄のままで使えます（アプリに組み込み済み）。';
+    sec.append(inp, sm); box.append(sec);
+  }
 }
 $('#bSet').onclick = () => { renderSettings(); openDrawer('dSet'); };
 $('#bSwap').onclick = () => { if (S.prevTool) setTool(S.prevTool); };
@@ -2298,8 +2495,10 @@ $('#bMeas').onclick = () => { renderMeasList(); openDrawer('dMeas'); };
 $('#bMono').onclick = () => { S.mono = !S.mono; $('#bMono').classList.toggle('on', S.mono); if (S.doc) build(); };
 $('#bSave').onclick = save;
 $('#bLocal').onclick = () => $('#fileIn').click();
-$('#bProj').onclick = () => browse(S.folder != null ? S.folder : savedFolder());
-$('#fsearch').addEventListener('input', onSearch);
+$('#bProj').onclick = () => { S.src = 'proj'; browse(S.folder != null ? S.folder : savedFolder()); };
+$('#bOD').onclick = () => odBrowse(OD.stack || lsGet('jwv.odFolder'));
+if (!odAvailable()) $('#bOD').style.display = 'none';
+$('#fsearch').addEventListener('input', () => (S.src === 'od' ? odSearch() : onSearch()));
 $('#fileIn').onchange = async (e) => {
   const f = e.target.files[0]; e.target.value = '';
   if (!f) return;
@@ -2367,7 +2566,12 @@ renderLayers(); renderMeasList();
 
 // ---------- claude.ai の機能（使えるときだけ） ----------
 (async () => {
-  if (!window.claude || !window.claude.use) { openDrawer('dFiles'); return; }
+  if (!window.claude || !window.claude.use) {
+    if (await odHandleRedirect()) return;
+    openDrawer('dFiles');
+    if (odAvailable() && odClientId() && lsGet('jwv.odTok')) odBrowse(lsGet('jwv.odFolder'));
+    return;
+  }
   const [files, downloads] = await Promise.all([window.claude.use('files').catch(() => null), window.claude.use('downloads').catch(() => null)]);
   S.files = files; S.downloads = downloads;
   if (S.doc) return;
