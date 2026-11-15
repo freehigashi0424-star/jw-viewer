@@ -1614,7 +1614,7 @@ function selAct(a) {
 
 // ---------- OneDrive（ホーム画面アプリ版で、OneDrive の図面を直接開く・保存する） ----------
 // Microsoft のサインイン（認可コード + PKCE）を自前で行い、Microsoft Graph でフォルダをたどる
-const OD_BUILTIN_ID = '/*OD_CLIENT_ID*/';
+const OD_BUILTIN_ID = '5714e831-3a12-49bc-8db2-c7de8600745c';
 const OD_AUTH = 'https://login.microsoftonline.com/common/oauth2/v2.0/';
 const OD_SCOPE = 'Files.ReadWrite.All offline_access User.Read';
 const OD = { stack: null, items: null, deep: null };
@@ -1647,7 +1647,12 @@ async function odHandleRedirect() {
   if (!code && !err) return false;
   history.replaceState(null, '', odRedirect());
   const pk = lsGet('jwv.odPkce'); lsSet('jwv.odPkce', null);
-  if (err) { toast('OneDrive にサインインできませんでした：' + (u.searchParams.get('error_description') || err), true); return true; }
+  if (err) {
+    const d = u.searchParams.get('error_description') || err;
+    toast(/AADSTS50194/.test(d) ? 'サインインできませんでした：アプリ登録の「サポートされているアカウントの種類」を「任意の組織ディレクトリ内のアカウントと個人用 Microsoft アカウント」に変えてください'
+      : /AADSTS65001|AADSTS90094|consent|承認/i.test(d) ? 'サインインできませんでした：会社の管理者の承認が必要です（' + d.slice(0, 80) + '）' : 'OneDrive にサインインできませんでした：' + d, true);
+    return true;
+  }
   if (!pk || pk.state !== u.searchParams.get('state')) { toast('サインインの確認に失敗しました。もう一度お試しください', true); return true; }
   try { await odTokenReq({ grant_type: 'authorization_code', code, redirect_uri: odRedirect(), code_verifier: pk.verifier }); openDrawer('dFiles'); odBrowse(lsGet('jwv.odFolder') || null); }
   catch (e) { toast('OneDrive にサインインできませんでした：' + e.message, true); }

@@ -1,5 +1,5 @@
 // オフラインでも起動できるように画面を保存しておく（新しい版があれば次回起動時に入れ替わる）
-const CACHE = 'jwv-0382c5570e';
+const CACHE = 'jwv-f2d1388d98';
 const FILES = ['./', 'index.html', 'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener('activate', (e) => { e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k))))); self.clients.claim(); });
